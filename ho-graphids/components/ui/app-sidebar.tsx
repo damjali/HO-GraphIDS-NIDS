@@ -17,8 +17,9 @@ import {
 } from "@/components/ui/sidebar"
 
 const navItems = [
-    { title: "Dashoard", url: "/", icon: Home },
-    { title: "Network Data Upload", url: "/upload", icon: UploadCloud }
+    { title: "Dashboard", url: "/", icon: Home },
+    { title: "Data Upload", url: "/upload", icon: UploadCloud },
+    { title: "Network Explorer", url: "/explorer", icon: UploadCloud }
 ]
 
 export function AppSidebar() {
