@@ -1,6 +1,7 @@
 "use client";
 
-import { Suspense, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import type { DatasetData, Flow } from "@/lib/datasets";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
@@ -10,6 +11,9 @@ import {
   Search,
   Table2,
   BarChart3,
+  ZoomIn,
+  ZoomOut,
+  Maximize,
 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
@@ -49,93 +53,12 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-// ---------- Mock dataset (replace with API: GET /api/datasets/:id/flows) ----------
+// Ids must match the keys in FILES (lib/datasets.ts).
 const DATASETS = [
   { id: "nf-unsw-nb15-v2", name: "NF-UNSW-NB15-v2" },
   { id: "nf-cse-cic-ids2018-v2", name: "NF-CSE-CIC-IDS2018-v2" },
-  { id: "nf-ton-iot-v2", name: "NF-ToN-IoT-v2" },
-  { id: "nf-bot-iot-v2", name: "NF-BoT-IoT-v2" },
-  { id: "um-campus-sample", name: "UM campus sample" },
-];
-
-type Flow = {
-  id: number;
-  src: string;
-  srcPort: number;
-  dst: string;
-  dstPort: number;
-  protocol: "TCP" | "UDP" | "ICMP";
-  l7Proto: number | null;
-  inBytes: number;
-  outBytes: number;
-  inPkts: number;
-  outPkts: number;
-  durationMs: number;
-  attack: string;
-};
-
-const ATTACKS = [
-  "Exploits",
-  "Fuzzers",
-  "Generic",
-  "Reconnaissance",
-  "DoS",
-  "Backdoor",
-  "Shellcode",
-  "Analysis",
-  "Worms",
-];
-
-// Small deterministic PRNG so the mock data is stable between renders.
-function mulberry32(seed: number) {
-  return () => {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function makeFlows(n: number): Flow[] {
-  const rnd = mulberry32(42);
-  const pick = <T,>(arr: T[]) => arr[Math.floor(rnd() * arr.length)];
-  const clients = Array.from({ length: 18 }, (_, i) => `10.0.${(i % 6) + 1}.${10 + i}`);
-  const servers = Array.from({ length: 6 }, (_, i) => `172.16.0.${i + 2}`);
-  return Array.from({ length: n }, (_, i) => {
-    const isAttack = rnd() < 0.16;
-    const r = rnd();
-    const protocol: Flow["protocol"] = r < 0.72 ? "TCP" : r < 0.95 ? "UDP" : "ICMP";
-    const scale = isAttack ? 6 : 1;
-    const inPkts = Math.max(1, Math.round(rnd() * 40 * scale));
-    const outPkts = Math.max(1, Math.round(rnd() * 30 * scale));
-    return {
-      id: i + 1,
-      src: pick(clients),
-      srcPort: 1024 + Math.floor(rnd() * 60000),
-      dst: pick(servers),
-      dstPort: pick([22, 53, 80, 443, 445, 3389, 8080]),
-      protocol,
-      l7Proto: rnd() < 0.04 ? null : pick([0, 5, 7, 91, 92, 120, 131, 178]),
-      inBytes: inPkts * (60 + Math.floor(rnd() * 900)),
-      outBytes: outPkts * (60 + Math.floor(rnd() * 900)),
-      inPkts,
-      outPkts,
-      durationMs: Math.floor(rnd() * 4000 * (isAttack ? 3 : 1)),
-      attack: isAttack ? pick(ATTACKS) : "Benign",
-    };
-  });
-}
-
-const FLOWS = makeFlows(300);
-
-const NUMERIC_COLUMNS: { key: keyof Flow; label: string }[] = [
-  { key: "inBytes", label: "IN_BYTES" },
-  { key: "outBytes", label: "OUT_BYTES" },
-  { key: "inPkts", label: "IN_PKTS" },
-  { key: "outPkts", label: "OUT_PKTS" },
-  { key: "durationMs", label: "FLOW_DURATION_MILLISECONDS" },
-  { key: "l7Proto", label: "L7_PROTO" },
+  { id: "nf-unsw-nb15-v3", name: "NF-UNSW-NB15-v3" },
+  { id: "nf-cse-cic-ids2018-v3", name: "NF-CSE-CIC-IDS2018-v3" },
 ];
 
 const PAGE_SIZE = 10;
@@ -168,8 +91,33 @@ function Explorer() {
   const [protoFilter, setProtoFilter] = useState("all");
   const [page, setPage] = useState(1);
 
-  // TODO: these should come from the backend for the selected dataset.
-  const flows = FLOWS;
+  const [data, setData] = useState<DatasetData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Load the selected dataset from the server (streams the CSV in /data).
+  useEffect(() => {
+    let cancelled = false; // ignore stale responses if the user switches dataset
+    setData(null);
+    setError(null);
+    fetch(`/api/datasets/${dataset.id}`)
+      .then(async (r) => {
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.error ?? "Failed to load dataset");
+        return body as DatasetData;
+      })
+      .then((d) => {
+        if (!cancelled) setData(d);
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setError(e.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [dataset.id]);
+
+  // Sample of rows for the table and graph. Totals/stats come from the full file.
+  const flows: Flow[] = useMemo(() => data?.flows ?? [], [data]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -188,52 +136,30 @@ function Explorer() {
   const safePage = Math.min(page, totalPages);
   const rows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
-  // Summary numbers
-  const attackCount = flows.filter((f) => f.attack !== "Benign").length;
-  const benignCount = flows.length - attackCount;
-
-  const classData = useMemo(() => {
-    const counts = new Map<string, number>();
-    flows.forEach((f) => counts.set(f.attack, (counts.get(f.attack) ?? 0) + 1));
-    return [...counts.entries()]
-      .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count);
-  }, [flows]);
-
-  const featureStats = useMemo(
-    () =>
-      NUMERIC_COLUMNS.map(({ key, label }) => {
-        const vals = flows
-          .map((f) => f[key])
-          .filter((v): v is number => typeof v === "number");
-        const missing = flows.length - vals.length;
-        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-        const std = Math.sqrt(
-          vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length
-        );
-        return {
-          label,
-          min: Math.min(...vals),
-          mean,
-          std,
-          max: Math.max(...vals),
-          missingPct: (missing / flows.length) * 100,
-        };
-      }),
-    [flows]
-  );
-
-  function resetPage<T>(setter: (v: T) => void) {
-    return (v: T) => {
+  function resetPage(setter: (v: string) => void) {
+    return (v: string | null) => {
+      if (v == null) return;
       setter(v);
       setPage(1);
     };
   }
 
-  function changeDataset(id: string) {
+  function changeDataset(id: string | null) {
+    if (id == null) return;
     router.replace(`${pathname}?dataset=${id}`);
     setPage(1);
   }
+
+  if (error) return <p className="p-6 text-destructive">{error}</p>;
+  if (!data)
+    return (
+      <p className="p-6 text-muted-foreground">
+        Loading {dataset.name}… the first load scans the whole CSV and can take a while.
+      </p>
+    );
+
+  const { total, benign: benignCount, attack: attackCount, classes: classData, featureStats } = data;
+  const attackTypes = classData.filter((c) => c.name !== "Benign");
 
   return (
     <div className="min-h-screen w-full bg-zinc-50 font-sans dark:bg-black">
@@ -261,8 +187,11 @@ function Explorer() {
                 ))}
               </SelectContent>
             </Select>
-            <Button asChild>
-              <Link href={`/training?dataset=${dataset.id}`}>Train</Link>
+            <Button
+              nativeButton={false}
+              render={<Link href={`/training?dataset=${dataset.id}`} />}
+            >
+              Train
             </Button>
           </div>
         </div>
@@ -271,9 +200,9 @@ function Explorer() {
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
           <Card>
             <CardHeader>
-              <CardDescription>Flows (sample)</CardDescription>
+              <CardDescription>Flows</CardDescription>
               <CardTitle className="text-2xl tabular-nums">
-                {fmt(flows.length)}
+                {fmt(total)}
               </CardTitle>
             </CardHeader>
           </Card>
@@ -285,7 +214,7 @@ function Explorer() {
               </CardTitle>
             </CardHeader>
             <CardFooter className="text-xs text-muted-foreground">
-              {((benignCount / flows.length) * 100).toFixed(1)}%
+              {((benignCount / total) * 100).toFixed(1)}%
             </CardFooter>
           </Card>
           <Card>
@@ -296,14 +225,14 @@ function Explorer() {
               </CardTitle>
             </CardHeader>
             <CardFooter className="text-xs text-muted-foreground">
-              {((attackCount / flows.length) * 100).toFixed(1)}%
+              {((attackCount / total) * 100).toFixed(1)}%
             </CardFooter>
           </Card>
           <Card>
             <CardHeader>
               <CardDescription>Attack types</CardDescription>
               <CardTitle className="text-2xl tabular-nums">
-                {classData.length - 1}
+                {attackTypes.length}
               </CardTitle>
             </CardHeader>
           </Card>
@@ -328,7 +257,7 @@ function Explorer() {
               <CardHeader>
                 <CardTitle>Flow records</CardTitle>
                 <CardDescription>
-                  {fmt(filtered.length)} of {fmt(flows.length)} flows match
+                  {fmt(filtered.length)} of {fmt(flows.length)} sampled flows match
                 </CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-4">
@@ -358,7 +287,7 @@ function Explorer() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="all">All attack types</SelectItem>
-                      {ATTACKS.map((a) => (
+                      {attackTypes.map(({ name: a }) => (
                         <SelectItem key={a} value={a}>
                           {a}
                         </SelectItem>
@@ -513,19 +442,19 @@ function Explorer() {
                   <div className="flex justify-between text-sm">
                     <span>Benign</span>
                     <span className="tabular-nums">
-                      {((benignCount / flows.length) * 100).toFixed(1)}%
+                      {((benignCount / total) * 100).toFixed(1)}%
                     </span>
                   </div>
-                  <Progress value={(benignCount / flows.length) * 100} />
+                  <Progress value={(benignCount / total) * 100} />
                 </div>
                 <div className="flex flex-col gap-1.5">
                   <div className="flex justify-between text-sm">
                     <span>Attack</span>
                     <span className="tabular-nums">
-                      {((attackCount / flows.length) * 100).toFixed(1)}%
+                      {((attackCount / total) * 100).toFixed(1)}%
                     </span>
                   </div>
-                  <Progress value={(attackCount / flows.length) * 100} />
+                  <Progress value={(attackCount / total) * 100} />
                 </div>
                 <p className="text-xs text-muted-foreground">
                   A skewed split means accuracy alone is misleading. Use
@@ -603,7 +532,7 @@ function Explorer() {
                 </CardAction>
               </CardHeader>
               <CardContent>
-                <GraphPreview flows={flows} />
+                <GraphPreview datasetId={dataset.id} />
               </CardContent>
             </Card>
           </TabsContent>
@@ -613,96 +542,404 @@ function Explorer() {
   );
 }
 
-// ---------- Graph preview (plain SVG, no extra libraries) ----------
-function GraphPreview({ flows }: { flows: Flow[] }) {
-  const { nodes, edges } = useMemo(() => {
-    // Take the 14 busiest hosts so the picture stays readable.
-    const degree = new Map<string, number>();
-    flows.forEach((f) => {
-      degree.set(f.src, (degree.get(f.src) ?? 0) + 1);
-      degree.set(f.dst, (degree.get(f.dst) ?? 0) + 1);
-    });
-    const top = [...degree.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 14)
-      .map(([ip]) => ip);
-    const set = new Set(top);
+// ---------- Graph preview (plain SVG, built from ALL flows on the server) ----------
+type GraphResponse = {
+  nodes: { ip: string; benign: number; attack: number }[];
+  edges: { s: string; d: string; benign: number; attack: number }[];
+  matchedEdges: number;
+  totalEdges: number;
+};
 
-    const edgeMap = new Map<string, { a: string; b: string; count: number; attacks: number }>();
-    const attackHosts = new Set<string>();
-    flows.forEach((f) => {
-      if (!set.has(f.src) || !set.has(f.dst)) return;
-      const key = `${f.src}>${f.dst}`;
-      const e = edgeMap.get(key) ?? { a: f.src, b: f.dst, count: 0, attacks: 0 };
-      e.count += 1;
-      if (f.attack !== "Benign") {
-        e.attacks += 1;
-        attackHosts.add(f.src);
-        attackHosts.add(f.dst);
-      }
-      edgeMap.set(key, e);
-    });
+function GraphPreview({ datasetId }: { datasetId: string }) {
+  const [mode, setMode] = useState("all");
+  const [limit, setLimit] = useState("60");
+  const [ip, setIp] = useState("");
+  const [debouncedIp, setDebouncedIp] = useState("");
+  const [graph, setGraph] = useState<GraphResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
-    // Circular layout: clients on the left arc, servers on the right arc.
-    const cx = 300;
-    const cy = 200;
-    const r = 160;
-    const positioned = top.map((ip, i) => {
-      const angle = (i / top.length) * Math.PI * 2 - Math.PI / 2;
-      return {
-        ip,
-        x: cx + r * Math.cos(angle),
-        y: cy + r * Math.sin(angle),
-        attack: attackHosts.has(ip),
-      };
-    });
-    return { nodes: positioned, edges: [...edgeMap.values()] };
-  }, [flows]);
+  // Wait for the user to stop typing before querying.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedIp(ip.trim()), 300);
+    return () => clearTimeout(t);
+  }, [ip]);
 
-  const pos = new Map(nodes.map((n) => [n.ip, n]));
-  const maxCount = Math.max(1, ...edges.map((e) => e.count));
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    const qs = new URLSearchParams({ mode, limit, ip: debouncedIp });
+    fetch(`/api/datasets/${datasetId}/graph?${qs}`)
+      .then(async (r) => {
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.error ?? "Failed to load graph");
+        return body as GraphResponse;
+      })
+      .then((g) => {
+        if (!cancelled) setGraph(g);
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setError(e.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [datasetId, mode, limit, debouncedIp]);
+
+  // Circular layout. Attack hosts are grouped together so they are easy to spot.
+  const { pos, maxCount } = useMemo(() => {
+    const nodes = [...(graph?.nodes ?? [])].sort(
+      (a, b) => Number(b.attack > 0) - Number(a.attack > 0) || a.ip.localeCompare(b.ip)
+    );
+    const cx = 400;
+    const cy = 260;
+    const r = 190;
+    const pos = new Map(
+      nodes.map((n, i) => {
+        const angle = (i / Math.max(1, nodes.length)) * Math.PI * 2 - Math.PI / 2;
+        return [
+          n.ip,
+          { ...n, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle), angle },
+        ] as const;
+      })
+    );
+    const maxCount = Math.max(1, ...(graph?.edges ?? []).map((e) => e.benign + e.attack));
+    return { pos, maxCount };
+  }, [graph]);
 
   return (
-    <svg
-      viewBox="0 0 600 400"
-      className="h-auto w-full max-h-[480px]"
-      role="img"
-      aria-label="Host communication graph"
-    >
-      {edges.map((e) => {
-        const a = pos.get(e.a)!;
-        const b = pos.get(e.b)!;
-        return (
-          <line
-            key={`${e.a}>${e.b}`}
-            x1={a.x}
-            y1={a.y}
-            x2={b.x}
-            y2={b.y}
-            strokeWidth={0.6 + (e.count / maxCount) * 3}
-            className={e.attacks > 0 ? "stroke-destructive" : "stroke-muted-foreground"}
-            strokeOpacity={e.attacks > 0 ? 0.55 : 0.25}
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2 md:flex-row md:items-center">
+        <Select
+          value={mode}
+          onValueChange={(v) => v != null && setMode(v)}
+        >
+          <SelectTrigger className="md:w-[170px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Benign + attack</SelectItem>
+            <SelectItem value="benign">Benign only</SelectItem>
+            <SelectItem value="attack">Attack only</SelectItem>
+          </SelectContent>
+        </Select>
+        <div className="relative flex-1">
+          <Search className="absolute left-2.5 top-2.5 size-4 text-muted-foreground" />
+          <Input
+            className="pl-8"
+            placeholder="Filter by IP address (e.g. 175.45.176.1)…"
+            value={ip}
+            onChange={(e) => setIp(e.target.value)}
           />
-        );
-      })}
-      {nodes.map((n) => (
-        <g key={n.ip}>
-          <circle
-            cx={n.x}
-            cy={n.y}
-            r={9}
-            className={n.attack ? "fill-destructive" : "fill-primary"}
-          />
-          <text
-            x={n.x}
-            y={n.y + (n.y > 200 ? 24 : -16)}
-            textAnchor="middle"
-            className="fill-muted-foreground text-[10px]"
+        </div>
+        <Select value={limit} onValueChange={(v) => v != null && setLimit(v)}>
+          <SelectTrigger className="md:w-[200px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="30">Max 30 edges</SelectItem>
+            <SelectItem value="60">Max 60 edges</SelectItem>
+            <SelectItem value="120">Max 120 edges</SelectItem>
+            <SelectItem value="all">All edges (up to 5,000)</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {error ? (
+        <p className="py-10 text-center text-destructive">{error}</p>
+      ) : !graph ? (
+        <p className="py-10 text-center text-muted-foreground">Loading graph…</p>
+      ) : (
+        <>
+          <p className="text-xs text-muted-foreground">
+            Showing {fmt(graph.edges.length)} of {fmt(graph.matchedEdges)} matching host
+            pairs ({fmt(graph.totalEdges)} in the whole dataset) across{" "}
+            {fmt(graph.nodes.length)} hosts. Built from every flow in the file.
+            {loading && " Updating…"}
+          </p>
+          {graph.edges.length === 0 ? (
+            <p className="py-10 text-center text-muted-foreground">
+              No host pairs match these filters.
+            </p>
+          ) : (
+            <GraphCanvas
+              pos={pos}
+              edges={graph.edges}
+              maxCount={maxCount}
+              loading={loading}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- Interactive canvas: zoom, pan, hover and click to highlight ----------
+type PosNode = {
+  ip: string;
+  benign: number;
+  attack: number;
+  x: number;
+  y: number;
+  angle: number;
+};
+type GraphEdge = GraphResponse["edges"][number];
+
+const VIEW_W = 800;
+const VIEW_H = 520;
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 40;
+
+function GraphCanvas({
+  pos,
+  edges,
+  maxCount,
+  loading,
+}: {
+  pos: Map<string, PosNode>;
+  edges: GraphEdge[];
+  maxCount: number;
+  loading: boolean;
+}) {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [view, setView] = useState({ x: 0, y: 0, k: 1 });
+  const [selected, setSelected] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
+  const drag = useRef<{ moved: number } | null>(null);
+
+  // New data: go back to the default view.
+  useEffect(() => {
+    setView({ x: 0, y: 0, k: 1 });
+    setSelected(null);
+    setHovered(null);
+  }, [edges]);
+
+  // Zoom around a point given in SVG coordinates, keeping that point fixed.
+  function zoomAt(sx: number, sy: number, factor: number) {
+    setView((v) => {
+      const k = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v.k * factor));
+      const r = k / v.k;
+      return { k, x: sx - (sx - v.x) * r, y: sy - (sy - v.y) * r };
+    });
+  }
+
+  // Wheel needs a non-passive listener so we can stop the page from scrolling.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const sx = ((e.clientX - rect.left) / rect.width) * VIEW_W;
+      const sy = ((e.clientY - rect.top) / rect.height) * VIEW_H;
+      zoomAt(sx, sy, Math.exp(-e.deltaY * 0.0015));
+    };
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+  }, []);
+
+  function onPointerDown(e: React.PointerEvent<SVGSVGElement>) {
+    drag.current = { moved: 0 };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+  function onPointerMove(e: React.PointerEvent<SVGSVGElement>) {
+    if (!drag.current) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const dx = (e.movementX / rect.width) * VIEW_W;
+    const dy = (e.movementY / rect.height) * VIEW_H;
+    drag.current.moved += Math.abs(e.movementX) + Math.abs(e.movementY);
+    setView((v) => ({ ...v, x: v.x + dx, y: v.y + dy }));
+  }
+  function onPointerUp() {
+    // A press that barely moved is a click on the background: clear the selection.
+    if (drag.current && drag.current.moved < 4) setSelected(null);
+    drag.current = null;
+  }
+
+  function zoomCenter(factor: number) {
+    zoomAt(VIEW_W / 2, VIEW_H / 2, factor);
+  }
+
+  const active = selected ?? hovered;
+
+  // Hosts directly connected to the active one.
+  const neighbours = useMemo(() => {
+    const set = new Set<string>();
+    if (!active) return set;
+    set.add(active);
+    for (const e of edges) {
+      if (e.s === active) set.add(e.d);
+      if (e.d === active) set.add(e.s);
+    }
+    return set;
+  }, [active, edges]);
+
+  const selectedNode = selected ? pos.get(selected) : undefined;
+  const selectedEdges = useMemo(
+    () =>
+      selected
+        ? edges
+            .filter((e) => e.s === selected || e.d === selected)
+            .sort((a, b) => b.benign + b.attack - (a.benign + a.attack))
+        : [],
+    [selected, edges]
+  );
+
+  const k = view.k;
+  const manyNodes = pos.size > 60;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="relative aspect-[800/520] w-full overflow-hidden rounded-md border bg-background">
+        <svg
+          ref={svgRef}
+          viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
+          className={`h-full w-full cursor-grab touch-none select-none active:cursor-grabbing ${
+            loading ? "opacity-60" : ""
+          }`}
+          role="img"
+          aria-label="Host communication graph"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+        >
+          <g transform={`translate(${view.x} ${view.y}) scale(${k})`}>
+            {edges.map((e) => {
+              const a = pos.get(e.s);
+              const b = pos.get(e.d);
+              if (!a || !b) return null;
+              const count = e.benign + e.attack;
+              const related = !active || e.s === active || e.d === active;
+              return (
+                <line
+                  key={`${e.s}>${e.d}`}
+                  x1={a.x}
+                  y1={a.y}
+                  x2={b.x}
+                  y2={b.y}
+                  vectorEffect="non-scaling-stroke"
+                  strokeWidth={0.6 + (Math.log1p(count) / Math.log1p(maxCount)) * 3.5}
+                  className={e.attack > 0 ? "stroke-destructive" : "stroke-muted-foreground"}
+                  strokeOpacity={related ? (e.attack > 0 ? 0.7 : 0.4) : 0.05}
+                >
+                  <title>
+                    {e.s} → {e.d}: {fmt(e.benign)} benign, {fmt(e.attack)} attack flows
+                  </title>
+                </line>
+              );
+            })}
+            {[...pos.values()].map((n) => {
+              const dim = active != null && !neighbours.has(n.ip);
+              const cos = Math.cos(n.angle);
+              const sin = Math.sin(n.angle);
+              // Constant on-screen size no matter the zoom level.
+              const r = 6 / Math.sqrt(k);
+              const showLabel =
+                n.ip === active ||
+                (active != null && neighbours.has(n.ip)) ||
+                (!manyNodes && !dim) ||
+                k >= 3;
+              return (
+                <g
+                  key={n.ip}
+                  opacity={dim ? 0.15 : 1}
+                  className="cursor-pointer"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelected((s) => (s === n.ip ? null : n.ip));
+                  }}
+                  onPointerEnter={() => setHovered(n.ip)}
+                  onPointerLeave={() => setHovered(null)}
+                >
+                  <circle
+                    cx={n.x}
+                    cy={n.y}
+                    r={n.ip === selected ? r * 1.5 : r}
+                    className={n.attack > 0 ? "fill-destructive" : "fill-primary"}
+                  >
+                    <title>
+                      {n.ip}: {fmt(n.benign)} benign, {fmt(n.attack)} attack flows
+                    </title>
+                  </circle>
+                  {showLabel && (
+                    <text
+                      x={n.x + (cos * 12) / k}
+                      y={n.y + (sin * 12) / k + 3 / k}
+                      textAnchor={cos > 0.2 ? "start" : cos < -0.2 ? "end" : "middle"}
+                      style={{ fontSize: 9 / k }}
+                      className="pointer-events-none fill-foreground"
+                    >
+                      {n.ip}
+                    </text>
+                  )}
+                </g>
+              );
+            })}
+          </g>
+        </svg>
+
+        <div className="absolute right-2 top-2 flex flex-col gap-1">
+          <Button size="icon-sm" variant="outline" aria-label="Zoom in" onClick={() => zoomCenter(1.5)}>
+            <ZoomIn />
+          </Button>
+          <Button size="icon-sm" variant="outline" aria-label="Zoom out" onClick={() => zoomCenter(1 / 1.5)}>
+            <ZoomOut />
+          </Button>
+          <Button
+            size="icon-sm"
+            variant="outline"
+            aria-label="Reset view"
+            onClick={() => setView({ x: 0, y: 0, k: 1 })}
           >
-            {n.ip}
-          </text>
-        </g>
-      ))}
-    </svg>
+            <Maximize />
+          </Button>
+        </div>
+        <span className="absolute bottom-2 left-2 rounded bg-background/80 px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">
+          {Math.round(k * 100)}%
+        </span>
+      </div>
+
+      <p className="text-xs text-muted-foreground">
+        Scroll to zoom, drag to pan, hover a host to highlight its connections, click
+        a host to pin it.
+      </p>
+
+      {selectedNode && (
+        <div className="rounded-md border p-3 text-sm">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-mono">{selectedNode.ip}</span>
+            <Button size="sm" variant="ghost" onClick={() => setSelected(null)}>
+              Clear
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {fmt(selectedNode.benign)} benign and {fmt(selectedNode.attack)} attack flows
+            across {fmt(selectedEdges.length)} connections shown
+          </p>
+          <ul className="mt-2 flex max-h-40 flex-col gap-1 overflow-y-auto font-mono text-xs">
+            {selectedEdges.map((e) => (
+              <li key={`${e.s}>${e.d}`} className="flex justify-between gap-2">
+                <span>
+                  {e.s} → {e.d}
+                </span>
+                <span className="tabular-nums text-muted-foreground">
+                  {fmt(e.benign)} benign
+                  {e.attack > 0 && (
+                    <span className="text-destructive"> · {fmt(e.attack)} attack</span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
   );
 }
