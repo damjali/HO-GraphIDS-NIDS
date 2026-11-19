@@ -1,16 +1,17 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
   Activity,
-  AlertTriangle,
   Brain,
+  Cpu,
   Database,
+  FlaskConical,
   Network,
-  ShieldCheck,
   Upload,
 } from "lucide-react";
-import { Area, AreaChart, CartesianGrid, XAxis } from "recharts";
+import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,54 +39,52 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import type { DatasetInfo, ModelInfo, RunDetail, RunMeta } from "@/lib/graphids/types";
 
-// ---- Mock data: replace with API calls to your backend ----
-const stats = {
-  totalFlows: 1_245_380,
-  benign: 1_182_904,
-  anomalous: 62_476,
-  modelVersion: "v1.3",
-  lastTrained: "2 Nov 2026, 21:14",
-  liveStatus: "running" as "running" | "stopped",
-  datasets: 4,
-};
-
-const trend = [
-  { time: "10:00", benign: 820, anomaly: 14 },
-  { time: "10:05", benign: 910, anomaly: 22 },
-  { time: "10:10", benign: 870, anomaly: 65 },
-  { time: "10:15", benign: 940, anomaly: 41 },
-  { time: "10:20", benign: 890, anomaly: 18 },
-  { time: "10:25", benign: 1020, anomaly: 77 },
-  { time: "10:30", benign: 980, anomaly: 30 },
-];
+type RunRow = Omit<RunMeta, "history" | "config">;
 
 const chartConfig = {
-  benign: { label: "Benign", color: "var(--chart-2)" },
-  anomaly: { label: "Anomaly", color: "var(--chart-5)" },
+  trainLoss: { label: "Train loss", color: "var(--chart-1)" },
+  valLoss: { label: "Validation loss", color: "var(--chart-2)" },
 } satisfies ChartConfig;
 
-const metrics = [
-  { label: "Accuracy", value: 98.2 },
-  { label: "Precision", value: 96.7 },
-  { label: "Recall", value: 95.4 },
-  { label: "F1 score", value: 96.0 },
-];
-
-const recentAlerts = [
-  { time: "16:41:08", src: "10.0.3.21:51322", dst: "172.16.0.5:445", proto: "TCP", score: 0.98, type: "Exploits" },
-  { time: "16:41:05", src: "10.0.7.14:40211", dst: "172.16.0.9:22", proto: "TCP", score: 0.93, type: "Brute Force" },
-  { time: "16:40:57", src: "10.0.2.88:53", dst: "172.16.0.2:53", proto: "UDP", score: 0.89, type: "DoS" },
-  { time: "16:40:44", src: "10.0.5.10:60122", dst: "172.16.0.5:80", proto: "TCP", score: 0.86, type: "Reconnaissance" },
-  { time: "16:40:31", src: "10.0.1.33:44871", dst: "172.16.0.7:3389", proto: "TCP", score: 0.81, type: "Backdoor" },
-];
-
-const fmt = (n: number) => n.toLocaleString("en-US");
+const pct = (v: number | undefined) => (v === undefined ? 0 : v * 100);
+const kind = (r: { modelType: string; numHops: number; hopMode: string }) =>
+  r.modelType === "HO-GraphIDS" ? `HO-GraphIDS ${r.numHops} hops (${r.hopMode})` : "GraphIDS";
 
 export default function Home() {
-  const anomalyPct = (stats.anomalous / stats.totalFlows) * 100;
-  const benignPct = 100 - anomalyPct;
-  const live = stats.liveStatus === "running";
+  const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [runs, setRuns] = useState<RunRow[]>([]);
+  const [latest, setLatest] = useState<RunDetail | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const [d, m, r] = await Promise.all([
+        fetch("/api/datasets").then((x) => x.json()),
+        fetch("/api/models").then((x) => x.json()),
+        fetch("/api/runs").then((x) => x.json()),
+      ]);
+      if (cancelled) return;
+      setDatasets(d.datasets);
+      setModels(m.models);
+      setRuns(r.runs);
+      const last = (m.models as ModelInfo[])[0];
+      if (last) {
+        const detail = await fetch(`/api/runs/${last.id}`).then((x) => x.json());
+        if (!cancelled) setLatest(detail.run);
+      }
+    };
+    load().catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const running = runs.find((r) => r.status === "running");
+  const lastModel = models[0];
+  const m = lastModel?.metrics;
 
   return (
     <div className="min-h-screen w-full bg-zinc-50 font-sans dark:bg-black">
@@ -99,15 +98,11 @@ export default function Home() {
             </p>
           </div>
           <div className="flex gap-2">
-            <Button asChild variant="outline" size="sm">
-              <Link href="/upload">
-                <Upload /> Upload data
-              </Link>
+            <Button variant="outline" size="sm" nativeButton={false} render={<Link href="/upload" />}>
+              <Upload /> Upload data
             </Button>
-            <Button asChild size="sm">
-              <Link href="/training">
-                <Brain /> Train model
-              </Link>
+            <Button size="sm" nativeButton={false} render={<Link href="/training" />}>
+              <Brain /> Train model
             </Button>
           </div>
         </div>
@@ -116,64 +111,60 @@ export default function Home() {
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Card>
             <CardHeader>
-              <CardDescription>Total flows</CardDescription>
-              <CardTitle className="text-2xl tabular-nums">
-                {fmt(stats.totalFlows)}
-              </CardTitle>
+              <CardDescription>Datasets</CardDescription>
+              <CardTitle className="text-2xl tabular-nums">{datasets.length}</CardTitle>
               <CardAction>
                 <Database className="size-4 text-muted-foreground" />
               </CardAction>
             </CardHeader>
             <CardFooter className="text-xs text-muted-foreground">
-              Across {stats.datasets} datasets
+              {datasets.filter((d) => d.source === "upload").length} uploaded ·{" "}
+              {datasets.filter((d) => d.enabled).length} ready for training
             </CardFooter>
           </Card>
 
           <Card>
             <CardHeader>
-              <CardDescription>Benign flows</CardDescription>
-              <CardTitle className="text-2xl tabular-nums">
-                {fmt(stats.benign)}
-              </CardTitle>
+              <CardDescription>Trained models</CardDescription>
+              <CardTitle className="text-2xl tabular-nums">{models.length}</CardTitle>
               <CardAction>
-                <ShieldCheck className="size-4 text-muted-foreground" />
+                <Cpu className="size-4 text-muted-foreground" />
               </CardAction>
             </CardHeader>
             <CardFooter className="text-xs text-muted-foreground">
-              {benignPct.toFixed(1)}% of all flows
+              {models.filter((x) => x.modelType === "HO-GraphIDS").length} HO-GraphIDS ·{" "}
+              {models.filter((x) => x.modelType === "GraphIDS").length} GraphIDS
             </CardFooter>
           </Card>
 
           <Card>
             <CardHeader>
-              <CardDescription>Anomalous flows</CardDescription>
+              <CardDescription>Latest model, macro F1</CardDescription>
               <CardTitle className="text-2xl tabular-nums">
-                {fmt(stats.anomalous)}
+                {m?.f1 !== undefined ? m.f1.toFixed(3) : "–"}
               </CardTitle>
               <CardAction>
-                <AlertTriangle className="size-4 text-destructive" />
+                <FlaskConical className="size-4 text-muted-foreground" />
               </CardAction>
             </CardHeader>
             <CardFooter className="text-xs text-muted-foreground">
-              {anomalyPct.toFixed(1)}% of all flows
+              {lastModel ? `${kind(lastModel)} on ${lastModel.dataset.label}` : "No trained model yet"}
             </CardFooter>
           </Card>
 
           <Card>
             <CardHeader>
-              <CardDescription>Live monitor</CardDescription>
-              <CardTitle className="text-2xl">
-                {live ? "Running" : "Stopped"}
-              </CardTitle>
+              <CardDescription>Current job</CardDescription>
+              <CardTitle className="text-2xl">{running ? "Running" : "Idle"}</CardTitle>
               <CardAction>
-                <Badge variant={live ? "default" : "secondary"}>
+                <Badge variant={running ? "default" : "secondary"}>
                   <Activity className="size-3" />
-                  {stats.modelVersion}
+                  {running ? running.mode : "none"}
                 </Badge>
               </CardAction>
             </CardHeader>
             <CardFooter className="text-xs text-muted-foreground">
-              Last trained {stats.lastTrained}
+              {running ? `${running.phase} · ${running.dataset.label}` : `${runs.length} runs so far`}
             </CardFooter>
           </Card>
         </div>
@@ -182,117 +173,139 @@ export default function Home() {
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
           <Card className="lg:col-span-2">
             <CardHeader>
-              <CardTitle>Flow activity</CardTitle>
+              <CardTitle>Latest training</CardTitle>
               <CardDescription>
-                Benign vs anomalous flows, last 30 minutes
+                {latest
+                  ? `Loss per epoch · ${kind(latest)} on ${latest.dataset.label}`
+                  : "Train a model to see its loss curve here."}
               </CardDescription>
-              <CardAction>
-                <Button asChild variant="ghost" size="sm">
-                  <Link href="/live">Open live monitor</Link>
-                </Button>
-              </CardAction>
             </CardHeader>
             <CardContent>
-              <ChartContainer config={chartConfig} className="h-[260px] w-full">
-                <AreaChart data={trend} margin={{ left: 12, right: 12 }}>
-                  <CartesianGrid vertical={false} />
-                  <XAxis
-                    dataKey="time"
-                    tickLine={false}
-                    axisLine={false}
-                    tickMargin={8}
-                  />
-                  <ChartTooltip content={<ChartTooltipContent />} />
-                  <Area
-                    dataKey="benign"
-                    type="monotone"
-                    fill="var(--color-benign)"
-                    fillOpacity={0.25}
-                    stroke="var(--color-benign)"
-                  />
-                  <Area
-                    dataKey="anomaly"
-                    type="monotone"
-                    fill="var(--color-anomaly)"
-                    fillOpacity={0.35}
-                    stroke="var(--color-anomaly)"
-                  />
-                </AreaChart>
-              </ChartContainer>
+              {latest && latest.history.length > 0 ? (
+                <ChartContainer config={chartConfig} className="h-[260px] w-full">
+                  <LineChart data={latest.history} margin={{ left: 12, right: 12 }}>
+                    <CartesianGrid vertical={false} />
+                    <XAxis dataKey="epoch" tickLine={false} axisLine={false} tickMargin={8} />
+                    <YAxis tickLine={false} axisLine={false} width={48} />
+                    <ChartTooltip content={<ChartTooltipContent />} />
+                    <Line dataKey="trainLoss" stroke="var(--color-trainLoss)" dot={false} />
+                    <Line dataKey="valLoss" stroke="var(--color-valLoss)" dot={false} />
+                  </LineChart>
+                </ChartContainer>
+              ) : (
+                <p className="py-16 text-center text-sm text-muted-foreground">
+                  No training history yet.
+                </p>
+              )}
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader>
-              <CardTitle>Active model</CardTitle>
+              <CardTitle>Latest model</CardTitle>
               <CardDescription>
-                HO-GraphIDS {stats.modelVersion} · test set
+                {lastModel ? `${kind(lastModel)} · held-out test split` : "Nothing trained yet"}
               </CardDescription>
               <CardAction>
                 <Network className="size-4 text-muted-foreground" />
               </CardAction>
             </CardHeader>
             <CardContent className="flex flex-col gap-4">
-              {metrics.map((m) => (
-                <div key={m.label} className="flex flex-col gap-1.5">
+              {[
+                { label: "Macro F1", value: pct(m?.f1) },
+                { label: "PR-AUC", value: pct(m?.prAuc) },
+              ].map((x) => (
+                <div key={x.label} className="flex flex-col gap-1.5">
                   <div className="flex justify-between text-sm">
-                    <span>{m.label}</span>
-                    <span className="font-medium tabular-nums">
-                      {m.value.toFixed(1)}%
-                    </span>
+                    <span>{x.label}</span>
+                    <span className="font-medium tabular-nums">{x.value.toFixed(1)}%</span>
                   </div>
-                  <Progress value={m.value} />
+                  <Progress value={x.value} />
                 </div>
               ))}
             </CardContent>
             <CardFooter>
-              <Button asChild variant="outline" size="sm" className="w-full">
-                <Link href="/evaluation">View full evaluation</Link>
+              <Button
+                variant="outline"
+                size="sm"
+                className="w-full"
+                nativeButton={false}
+                render={<Link href={lastModel ? `/testing?model=${lastModel.id}` : "/testing"} />}
+              >
+                Test this model
               </Button>
             </CardFooter>
           </Card>
         </div>
 
-        {/* Recent alerts */}
+        {/* Recent runs */}
         <Card>
           <CardHeader>
-            <CardTitle>Recent alerts</CardTitle>
-            <CardDescription>Latest flows flagged as anomalous</CardDescription>
-            <CardAction>
-              <Button asChild variant="outline" size="sm">
-                <Link href="/flows">View all flows</Link>
-              </Button>
-            </CardAction>
+            <CardTitle>Recent runs</CardTitle>
+            <CardDescription>Training and testing jobs, newest first</CardDescription>
           </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Time</TableHead>
-                  <TableHead>Source</TableHead>
-                  <TableHead>Destination</TableHead>
-                  <TableHead>Protocol</TableHead>
-                  <TableHead>Attack type</TableHead>
-                  <TableHead className="text-right">Score</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {recentAlerts.map((a) => (
-                  <TableRow key={`${a.time}-${a.src}`}>
-                    <TableCell className="font-mono text-xs">{a.time}</TableCell>
-                    <TableCell className="font-mono text-xs">{a.src}</TableCell>
-                    <TableCell className="font-mono text-xs">{a.dst}</TableCell>
-                    <TableCell>{a.proto}</TableCell>
-                    <TableCell>
-                      <Badge variant="destructive">{a.type}</Badge>
-                    </TableCell>
-                    <TableCell className="text-right font-medium tabular-nums">
-                      {a.score.toFixed(2)}
-                    </TableCell>
+          <CardContent className="overflow-x-auto">
+            {runs.length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">No runs yet.</p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>When</TableHead>
+                    <TableHead>Type</TableHead>
+                    <TableHead>Model</TableHead>
+                    <TableHead>Dataset</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead className="text-right">F1</TableHead>
+                    <TableHead className="text-right">PR-AUC</TableHead>
+                    <TableHead />
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {runs.slice(0, 8).map((r) => (
+                    <TableRow key={r.id}>
+                      <TableCell>{new Date(r.createdAt).toLocaleString()}</TableCell>
+                      <TableCell className="capitalize">{r.mode}</TableCell>
+                      <TableCell>{kind(r)}</TableCell>
+                      <TableCell>{r.dataset.label}</TableCell>
+                      <TableCell>
+                        <Badge
+                          variant={
+                            r.status === "failed"
+                              ? "destructive"
+                              : r.status === "running"
+                                ? "default"
+                                : "secondary"
+                          }
+                        >
+                          {r.status}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {r.metrics?.f1 !== undefined ? r.metrics.f1.toFixed(4) : "–"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {r.metrics?.prAuc !== undefined ? r.metrics.prAuc.toFixed(4) : "–"}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          nativeButton={false}
+                          render={
+                            <Link
+                              href={r.mode === "train" ? `/training?run=${r.id}` : `/testing?run=${r.id}`}
+                            />
+                          }
+                        >
+                          Open
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
           </CardContent>
         </Card>
       </div>

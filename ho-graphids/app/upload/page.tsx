@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   AlertCircle,
@@ -9,6 +9,7 @@ import {
   Database,
   FileSpreadsheet,
   HardDrive,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
@@ -37,83 +38,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import type { DatasetInfo } from "@/lib/graphids/types";
 
-// ---------- Types & mock data (replace with API calls) ----------
-type Dataset = {
-  id: string;
-  name: string;
-  description: string;
-  flows: number;
-  sizeMB: number;
-  attackTypes: number;
-  source: "built-in" | "uploaded";
-  uploadedAt?: string;
-};
-
-// TODO: swap these for the 4 datasets you actually have (GET /api/datasets)
-const BUILT_IN: Dataset[] = [
-  {
-    id: "nf-unsw-nb15-v2",
-    name: "NF-UNSW-NB15-v2",
-    description: "NetFlow v2 version of UNSW-NB15 with 9 attack families.",
-    flows: 2_390_275,
-    sizeMB: 420,
-    attackTypes: 9,
-    source: "built-in",
-  },
-  {
-    id: "nf-cse-cic-ids2018-v2",
-    name: "NF-CSE-CIC-IDS2018-v2",
-    description: "NetFlow v2 version of CSE-CIC-IDS2018 with 14 attack types.",
-    flows: 18_893_708,
-    sizeMB: 3100,
-    attackTypes: 14,
-    source: "built-in",
-  },
-  {
-    id: "nf-ton-iot-v2",
-    name: "NF-ToN-IoT-v2",
-    description: "NetFlow v2 version of ToN-IoT, IoT and IIoT traffic.",
-    flows: 16_940_496,
-    sizeMB: 2800,
-    attackTypes: 10,
-    source: "built-in",
-  },
-  {
-    id: "nf-bot-iot-v2",
-    name: "NF-BoT-IoT-v2",
-    description: "NetFlow v2 version of BoT-IoT, botnet traffic.",
-    flows: 37_763_497,
-    sizeMB: 6200,
-    attackTypes: 4,
-    source: "built-in",
-  },
-];
-
-const INITIAL_UPLOADED: Dataset[] = [
-  {
-    id: "um-campus-sample",
-    name: "UM campus sample",
-    description: "Local flows exported from the campus network.",
-    flows: 154_220,
-    sizeMB: 38,
-    attackTypes: 0,
-    source: "uploaded",
-    uploadedAt: "10 Nov 2026",
-  },
-];
-
-// Columns the backend needs to build the host graph and run the model.
-const REQUIRED_COLUMNS = [
-  "IPV4_SRC_ADDR",
-  "IPV4_DST_ADDR",
-  "PROTOCOL",
-  "IN_BYTES",
-  "OUT_BYTES",
-  "IN_PKTS",
-  "OUT_PKTS",
-];
-// Needed only for training/evaluation, so missing ones are a warning.
+// What the server needs to build the host graph and run the model.
+const REQUIRED_COLUMNS = ["IPV4_SRC_ADDR", "IPV4_DST_ADDR"];
+// Needed only to train, or to measure accuracy when testing.
 const LABEL_COLUMNS = ["Label", "Attack"];
 
 type Validation = {
@@ -122,9 +51,17 @@ type Validation = {
   missingLabels: string[];
 };
 
+// Basic facts about a built-in dataset, from the explorer's cached summary.
+type Summary = { flows: number; attackTypes: number };
+
+const DESCRIPTIONS: Record<string, string> = {
+  "nf-unsw-nb15-v2": "NetFlow v2 version of UNSW-NB15 with 9 attack families.",
+  "nf-unsw-nb15-v3": "NetFlow v3 version of UNSW-NB15, with flow timestamps.",
+  "nf-cse-cic-ids2018-v2": "NetFlow v2 version of CSE-CIC-IDS2018.",
+  "nf-cse-cic-ids2018-v3": "NetFlow v3 version of CSE-CIC-IDS2018, with flow timestamps.",
+};
+
 const fmt = (n: number) => n.toLocaleString("en-US");
-const fmtSize = (mb: number) =>
-  mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb.toFixed(0)} MB`;
 const fmtBytes = (b: number) =>
   b >= 1024 ** 3
     ? `${(b / 1024 ** 3).toFixed(2)} GB`
@@ -132,11 +69,9 @@ const fmtBytes = (b: number) =>
 
 // Reads only the first 64 KB of the file to check the header row.
 async function validateCsv(file: File): Promise<Validation> {
-  const text = await file.slice(0, 64 * 1024).text();
+  const text = (await file.slice(0, 64 * 1024).text()).replace(/^﻿/, "");
   const header = text.split(/\r?\n/)[0] ?? "";
-  const columns = header
-    .split(",")
-    .map((c) => c.trim().replace(/^"|"$/g, ""));
+  const columns = header.split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
   return {
     columns,
     missingRequired: REQUIRED_COLUMNS.filter((c) => !columns.includes(c)),
@@ -144,24 +79,32 @@ async function validateCsv(file: File): Promise<Validation> {
   };
 }
 
-// TODO: replace with a real upload, e.g. XMLHttpRequest/fetch to your backend
-// (POST /api/datasets/upload with FormData) and call onProgress from
-// xhr.upload.onprogress. This simulates progress so the UI can be tested.
-function uploadToBackend(
-  _file: File,
-  _name: string,
+// Sends the raw file as the request body (no multipart), so the server can stream
+// it to disk. XMLHttpRequest is used because fetch cannot report upload progress.
+function uploadToServer(
+  file: File,
+  name: string,
   onProgress: (pct: number) => void
-): Promise<void> {
-  return new Promise((resolve) => {
-    let pct = 0;
-    const timer = setInterval(() => {
-      pct = Math.min(100, pct + 8 + Math.random() * 10);
-      onProgress(pct);
-      if (pct >= 100) {
-        clearInterval(timer);
-        resolve();
+): Promise<DatasetInfo> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/uploads?name=${encodeURIComponent(name)}`);
+    xhr.setRequestHeader("content-type", "text/csv");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress((e.loaded / e.total) * 100);
+    };
+    xhr.onload = () => {
+      let body: { upload?: DatasetInfo; error?: string } = {};
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        /* not JSON */
       }
-    }, 150);
+      if (xhr.status >= 200 && xhr.status < 300 && body.upload) resolve(body.upload);
+      else reject(new Error(body.error ?? `Upload failed (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error("Network error during upload"));
+    xhr.send(file);
   });
 }
 
@@ -169,8 +112,9 @@ export default function UploadPage() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const [tab, setTab] = useState("select");
+  const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
+  const [summaries, setSummaries] = useState<Record<string, Summary>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [uploaded, setUploaded] = useState<Dataset[]>(INITIAL_UPLOADED);
 
   const [file, setFile] = useState<File | null>(null);
   const [datasetName, setDatasetName] = useState("");
@@ -180,8 +124,44 @@ export default function UploadPage() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
-  const allDatasets = [...BUILT_IN, ...uploaded];
-  const selected = allDatasets.find((d) => d.id === selectedId) ?? null;
+  const builtIn = datasets.filter((d) => d.source === "builtin");
+  const uploaded = datasets.filter((d) => d.source === "upload");
+  const selected = datasets.find((d) => d.id === selectedId) ?? null;
+
+  const refresh = useCallback(async () => {
+    const r = await fetch("/api/datasets");
+    const b = await r.json();
+    setDatasets(b.datasets as DatasetInfo[]);
+  }, []);
+
+  useEffect(() => {
+    fetch("/api/datasets")
+      .then((r) => r.json())
+      .then((b) => setDatasets(b.datasets as DatasetInfo[]))
+      .catch(() => {});
+  }, []);
+
+  // Flow and attack-type counts come from the explorer's cached summaries, so this
+  // is instant for datasets that were scanned before.
+  useEffect(() => {
+    for (const d of builtIn) {
+      if (summaries[d.id]) continue;
+      fetch(`/api/datasets/${d.id}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((s) => {
+          if (!s) return;
+          setSummaries((prev) => ({
+            ...prev,
+            [d.id]: {
+              flows: s.total,
+              attackTypes: s.classes.filter((c: { name: string }) => c.name !== "Benign").length,
+            },
+          }));
+        })
+        .catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [datasets]);
 
   async function handleFile(f: File | undefined | null) {
     if (!f) return;
@@ -215,30 +195,22 @@ export default function UploadPage() {
     setUploading(true);
     setError(null);
     try {
-      await uploadToBackend(file, datasetName, setProgress);
-      const newDataset: Dataset = {
-        id: `local-${Date.now()}`,
-        name: datasetName || file.name,
-        description: "Uploaded local dataset.",
-        flows: 0, // TODO: backend should return the real row count
-        sizeMB: file.size / 1024 ** 2,
-        attackTypes: 0,
-        source: "uploaded",
-        uploadedAt: new Date().toLocaleDateString("en-GB", {
-          day: "numeric",
-          month: "short",
-          year: "numeric",
-        }),
-      };
-      setUploaded((prev) => [newDataset, ...prev]);
-      setSelectedId(newDataset.id);
+      const created = await uploadToServer(file, `${datasetName.trim() || file.name}.csv`, setProgress);
+      await refresh();
+      setSelectedId(created.id);
       clearFile();
       setTab("select");
-    } catch {
-      setError("Upload failed. Please try again.");
+    } catch (e) {
+      setError((e as Error).message);
     } finally {
       setUploading(false);
     }
+  }
+
+  async function removeUpload(id: string) {
+    await fetch(`/api/uploads?name=${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (selectedId === id) setSelectedId(null);
+    await refresh();
   }
 
   const canUpload =
@@ -276,10 +248,11 @@ export default function UploadPage() {
                 Built-in datasets
               </h2>
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                {BUILT_IN.map((d) => (
+                {builtIn.map((d) => (
                   <DatasetCard
                     key={d.id}
                     dataset={d}
+                    summary={summaries[d.id]}
                     selected={d.id === selectedId}
                     onSelect={() => setSelectedId(d.id)}
                   />
@@ -291,14 +264,11 @@ export default function UploadPage() {
               <CardHeader>
                 <CardTitle>Your uploaded datasets</CardTitle>
                 <CardDescription>
-                  Local files you have uploaded to this workspace
+                  Files you have uploaded to this workspace. They are stored in the
+                  project&apos;s data folder.
                 </CardDescription>
                 <CardAction>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setTab("upload")}
-                  >
+                  <Button variant="outline" size="sm" onClick={() => setTab("upload")}>
                     <Upload /> Upload new
                   </Button>
                 </CardAction>
@@ -313,8 +283,8 @@ export default function UploadPage() {
                     <TableHeader>
                       <TableRow>
                         <TableHead>Name</TableHead>
-                        <TableHead>Uploaded</TableHead>
-                        <TableHead className="text-right">Flows</TableHead>
+                        <TableHead>Columns</TableHead>
+                        <TableHead>Labels</TableHead>
                         <TableHead className="text-right">Size</TableHead>
                         <TableHead className="text-right" />
                       </TableRow>
@@ -322,21 +292,33 @@ export default function UploadPage() {
                     <TableBody>
                       {uploaded.map((d) => (
                         <TableRow key={d.id}>
-                          <TableCell className="font-medium">{d.name}</TableCell>
-                          <TableCell>{d.uploadedAt}</TableCell>
-                          <TableCell className="text-right tabular-nums">
-                            {d.flows ? fmt(d.flows) : "Processing"}
+                          <TableCell className="font-medium">{d.label}</TableCell>
+                          <TableCell>{d.version}</TableCell>
+                          <TableCell>
+                            {d.labeled ? (
+                              <Badge variant="secondary">Labeled</Badge>
+                            ) : (
+                              <Badge variant="outline">Unlabeled</Badge>
+                            )}
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
-                            {fmtSize(d.sizeMB)}
+                            {d.sizeBytes ? fmtBytes(d.sizeBytes) : "–"}
                           </TableCell>
-                          <TableCell className="text-right">
+                          <TableCell className="flex justify-end gap-2">
                             <Button
                               size="sm"
                               variant={d.id === selectedId ? "default" : "outline"}
                               onClick={() => setSelectedId(d.id)}
                             >
                               {d.id === selectedId ? "Selected" : "Select"}
+                            </Button>
+                            <Button
+                              size="icon-sm"
+                              variant="ghost"
+                              aria-label={`Delete ${d.label}`}
+                              onClick={() => removeUpload(d.id)}
+                            >
+                              <Trash2 />
                             </Button>
                           </TableCell>
                         </TableRow>
@@ -353,29 +335,38 @@ export default function UploadPage() {
                 <CardTitle>Selected dataset</CardTitle>
                 <CardDescription>
                   {selected
-                    ? `${selected.name} will be used for training and testing.`
+                    ? selected.enabled
+                      ? `${selected.label} is ready to use.`
+                      : (selected.reason ?? "This dataset cannot be trained on.")
                     : "No dataset selected yet."}
                 </CardDescription>
               </CardHeader>
-              <CardFooter className="gap-2">
-                <Button asChild disabled={!selected}>
-                  <Link
-                    href={selected ? `/training?dataset=${selected.id}` : "#"}
-                    aria-disabled={!selected}
-                    className={!selected ? "pointer-events-none opacity-50" : ""}
-                  >
-                    Continue to training <ArrowRight />
-                  </Link>
+              <CardFooter className="flex flex-wrap gap-2">
+                <Button
+                  nativeButton={false}
+                  disabled={!selected || !selected.enabled}
+                  render={<Link href={selected ? `/training?dataset=${selected.id}` : "#"} />}
+                >
+                  Continue to training <ArrowRight />
                 </Button>
-                <Button asChild variant="outline" disabled={!selected}>
-                  <Link
-                    href={selected ? `/explorer?dataset=${selected.id}` : "#"}
-                    aria-disabled={!selected}
-                    className={!selected ? "pointer-events-none opacity-50" : ""}
+                {selected?.source === "upload" && (
+                  <Button
+                    variant="outline"
+                    nativeButton={false}
+                    render={<Link href="/testing" />}
+                  >
+                    Test with a trained model
+                  </Button>
+                )}
+                {selected?.source === "builtin" && (
+                  <Button
+                    variant="outline"
+                    nativeButton={false}
+                    render={<Link href={`/explorer?dataset=${selected.id}`} />}
                   >
                     Explore data
-                  </Link>
-                </Button>
+                  </Button>
+                )}
               </CardFooter>
             </Card>
           </TabsContent>
@@ -386,7 +377,7 @@ export default function UploadPage() {
               <CardHeader>
                 <CardTitle>Upload a local dataset</CardTitle>
                 <CardDescription>
-                  CSV file of NetFlow records (same format as NF-UNSW-NB15-v2).
+                  CSV file of NetFlow records in the NF-UNSW-NB15 v2 or v3 column format.
                 </CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-5">
@@ -396,9 +387,7 @@ export default function UploadPage() {
                     role="button"
                     tabIndex={0}
                     onClick={() => inputRef.current?.click()}
-                    onKeyDown={(e) =>
-                      e.key === "Enter" && inputRef.current?.click()
-                    }
+                    onKeyDown={(e) => e.key === "Enter" && inputRef.current?.click()}
                     onDragOver={(e) => {
                       e.preventDefault();
                       setDragging(true);
@@ -410,9 +399,7 @@ export default function UploadPage() {
                       handleFile(e.dataTransfer.files?.[0]);
                     }}
                     className={`flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed p-10 text-center transition-colors ${
-                      dragging
-                        ? "border-primary bg-primary/5"
-                        : "border-border hover:bg-muted/50"
+                      dragging ? "border-primary bg-primary/5" : "border-border hover:bg-muted/50"
                     }`}
                   >
                     <Upload className="size-8 text-muted-foreground" />
@@ -446,13 +433,10 @@ export default function UploadPage() {
                     <div className="flex items-center gap-3 rounded-lg border p-3">
                       <FileSpreadsheet className="size-8 text-muted-foreground" />
                       <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-medium">
-                          {file.name}
-                        </p>
+                        <p className="truncate text-sm font-medium">{file.name}</p>
                         <p className="text-xs text-muted-foreground">
                           {fmtBytes(file.size)}
-                          {validation &&
-                            ` · ${validation.columns.length} columns detected`}
+                          {validation && ` · ${validation.columns.length} columns detected`}
                         </p>
                       </div>
                       <Button
@@ -466,7 +450,6 @@ export default function UploadPage() {
                       </Button>
                     </div>
 
-                    {/* Validation result */}
                     {validation && validation.missingRequired.length > 0 && (
                       <Alert variant="destructive">
                         <AlertCircle className="size-4" />
@@ -488,9 +471,10 @@ export default function UploadPage() {
                         <CheckCircle2 className="size-4" />
                         <AlertTitle>Format looks good</AlertTitle>
                         <AlertDescription>
-                          All required NetFlow columns are present.
-                          {validation.missingLabels.length > 0 &&
-                            ` No ${validation.missingLabels.join(" / ")} column found, so this file can be used for testing but not for training or evaluation.`}
+                          The IP address columns are present.
+                          {validation.missingLabels.length > 0
+                            ? ` No ${validation.missingLabels.join(" / ")} column found, so this file can be used for testing a trained model but not for training. Its columns must match the model's dataset (checked when you start a test).`
+                            : " Labeled files can be used for training, and testing reports accuracy against the labels."}
                         </AlertDescription>
                       </Alert>
                     )}
@@ -509,10 +493,8 @@ export default function UploadPage() {
                     {uploading && (
                       <div className="flex flex-col gap-1.5">
                         <div className="flex justify-between text-sm">
-                          <span>Uploading…</span>
-                          <span className="tabular-nums">
-                            {Math.round(progress)}%
-                          </span>
+                          <span>{progress >= 100 ? "Checking the file…" : "Uploading…"}</span>
+                          <span className="tabular-nums">{Math.round(progress)}%</span>
                         </div>
                         <Progress value={progress} />
                       </div>
@@ -531,7 +513,7 @@ export default function UploadPage() {
                     ))}
                   </div>
                   <p className="mb-2 mt-3 text-sm font-medium">
-                    Optional (needed for training)
+                    Needed for training, and for accuracy figures when testing
                   </p>
                   <div className="flex flex-wrap gap-1">
                     {LABEL_COLUMNS.map((c) => (
@@ -540,17 +522,18 @@ export default function UploadPage() {
                       </Badge>
                     ))}
                   </div>
+                  <p className="mt-3 text-xs text-muted-foreground">
+                    Files that contain <code>FLOW_START_MILLISECONDS</code> are treated as the
+                    v3 format, the others as v2. A model can only score files that have all
+                    the feature columns it was trained on.
+                  </p>
                 </div>
               </CardContent>
               <CardFooter className="gap-2">
                 <Button onClick={handleUpload} disabled={!canUpload}>
                   <Upload /> {uploading ? "Uploading…" : "Upload dataset"}
                 </Button>
-                <Button
-                  variant="outline"
-                  onClick={() => setTab("select")}
-                  disabled={uploading}
-                >
+                <Button variant="outline" onClick={() => setTab("select")} disabled={uploading}>
                   Cancel
                 </Button>
               </CardFooter>
@@ -565,22 +548,20 @@ export default function UploadPage() {
 // ---------- Dataset card ----------
 function DatasetCard({
   dataset,
+  summary,
   selected,
   onSelect,
 }: {
-  dataset: Dataset;
+  dataset: DatasetInfo;
+  summary?: Summary;
   selected: boolean;
   onSelect: () => void;
 }) {
   return (
-    <Card
-      className={`transition-colors ${
-        selected ? "border-primary ring-1 ring-primary" : ""
-      }`}
-    >
+    <Card className={`transition-colors ${selected ? "border-primary ring-1 ring-primary" : ""}`}>
       <CardHeader>
-        <CardTitle>{dataset.name}</CardTitle>
-        <CardDescription>{dataset.description}</CardDescription>
+        <CardTitle>{dataset.label}</CardTitle>
+        <CardDescription>{DESCRIPTIONS[dataset.id] ?? ""}</CardDescription>
         <CardAction>
           {selected ? (
             <Badge>
@@ -591,21 +572,26 @@ function DatasetCard({
           )}
         </CardAction>
       </CardHeader>
-      <CardContent>
+      <CardContent className="flex flex-col gap-3">
         <div className="grid grid-cols-3 gap-2 text-sm">
           <div>
             <p className="text-xs text-muted-foreground">Flows</p>
-            <p className="font-medium tabular-nums">{fmt(dataset.flows)}</p>
+            <p className="font-medium tabular-nums">{summary ? fmt(summary.flows) : "–"}</p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Size</p>
-            <p className="font-medium tabular-nums">{fmtSize(dataset.sizeMB)}</p>
+            <p className="font-medium tabular-nums">
+              {dataset.sizeBytes ? fmtBytes(dataset.sizeBytes) : "Not on disk"}
+            </p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Attack types</p>
-            <p className="font-medium tabular-nums">{dataset.attackTypes}</p>
+            <p className="font-medium tabular-nums">{summary ? summary.attackTypes : "–"}</p>
           </div>
         </div>
+        {!dataset.enabled && dataset.reason && (
+          <p className="text-xs text-muted-foreground">Training unavailable: {dataset.reason}</p>
+        )}
       </CardContent>
       <CardFooter>
         <Button

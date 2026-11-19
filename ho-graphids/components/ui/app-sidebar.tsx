@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { Home, Inbox, Calendar, Settings, User, UploadCloud } from "lucide-react"
+import { Cpu, FlaskConical, Home, Network, UploadCloud } from "lucide-react"
 
 import {
     Sidebar,
@@ -19,7 +19,9 @@ import {
 const navItems = [
     { title: "Dashboard", url: "/", icon: Home },
     { title: "Data Upload", url: "/upload", icon: UploadCloud },
-    { title: "Network Explorer", url: "/explorer", icon: UploadCloud }
+    { title: "Network Explorer", url: "/explorer", icon: Network },
+    { title: "Train", url: "/training", icon: Cpu },
+    { title: "Test", url: "/testing", icon: FlaskConical },
 ]
 
 export function AppSidebar() {
@@ -40,11 +42,12 @@ export function AppSidebar() {
 
                                 return (
                                     <SidebarMenuItem key={item.title}>
-                                        <SidebarMenuButton asChild isActive={isActive}>
-                                            <Link href={item.url}>
-                                                <item.icon />
-                                                <span>{item.title}</span>
-                                            </Link>
+                                        <SidebarMenuButton
+                                            render={<Link href={item.url} />}
+                                            isActive={isActive}
+                                        >
+                                            <item.icon />
+                                            <span>{item.title}</span>
                                         </SidebarMenuButton>
                                     </SidebarMenuItem>
                                 )
